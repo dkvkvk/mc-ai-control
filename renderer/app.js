@@ -41,6 +41,14 @@ const state = {
     since: 0,
 };
 
+// 心跳必须在最早期就开始跑：后端靠它判断"窗口还在不在"，
+// 一旦放到 boot() 末尾，加载中途出错就会导致窗口开着、后端却退出。
+(function startHeartbeat() {
+    const beat = () => fetch('/api/beat').catch(() => {});
+    beat();
+    setInterval(beat, 3000);
+})();
+
 const VIEW_TITLE = { overview: '概览', server: '服务器', bot: 'AI 机器人', logs: '日志', settings: '设置' };
 
 // ------------------------------------------------------------------ 提示条
@@ -341,9 +349,4 @@ async function poll() {
     await refresh();
     setInterval(refresh, 2500);
     setInterval(poll, 1000);
-
-    // 心跳：窗口关掉后后端会自动退出
-    const beat = () => fetch('/api/beat').catch(() => {});
-    beat();
-    setInterval(beat, 3000);
 })();
