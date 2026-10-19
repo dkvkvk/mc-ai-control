@@ -130,7 +130,7 @@ function startLogTail() {
             tail.rest = lines.pop();
             for (const raw of lines) {
                 if (!raw) continue;
-                if (LOG_KEEP.test(raw)) pushLog('server', raw.replace(/^\[[^\]]*\]\s*(\[[^\]]*\]\s*)?/, ''));
+                if (LOG_KEEP.test(raw)) pushLog('server', raw.replace(/^\[[^\]]*\]\s*(?:\[[^\]]*\]\s*)?:?\s*/, ''));
             }
         } catch { /* 文件被占用，跳过 */ }
     }, 900);
