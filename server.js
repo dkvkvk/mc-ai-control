@@ -72,42 +72,65 @@ function pushLog(src, line) {
     if (l) players.delete(l[1]);
 }
 
-function pipeLines(stream, src) {
+// ------------------------------------------------------------------ 解码
+// Windows 中文环境下 java 的 stdout 与 latest.log 常是 GBK（cp936），
+// 直接按 UTF-8 解会得到 "锛?/锟?" 这类乱码。这里先严格试 UTF-8，失败再回退 GBK。
+const DECODERS = { utf8: () => new TextDecoder('utf-8'), gbk: () => new TextDecoder('gbk') };
+
+function sniffEncoding(buf) {
+    try {
+        new TextDecoder('utf-8', { fatal: true }).decode(buf);
+        return 'utf8';
+    } catch { return 'gbk'; }
+}
+
+function pipeLines(stream, src, enc, only) {
+    const decoder = DECODERS[enc || 'utf8']();
     let buf = '';
-    stream.setEncoding('utf8');
+    const emit = (line) => {
+        if (!line || (only && !only.test(line))) return;
+        pushLog(src, line);
+    };
     stream.on('data', (chunk) => {
-        buf += chunk;
+        buf += decoder.decode(chunk, { stream: true });
         const parts = buf.split('\n');
         buf = parts.pop();
-        for (const p of parts) pushLog(src, p);
+        for (const p of parts) emit(p);
     });
-    stream.on('end', () => { if (buf) pushLog(src, buf); });
+    stream.on('end', () => {
+        buf += decoder.decode();
+        if (buf) emit(buf);
+    });
 }
 
 // 跟随服务端 latest.log（外部启动的服务器也能看到聊天）
 let logTimer = null;
-let logOffset = 0;
+let tail = { offset: 0, decoder: null, rest: '' };
+const LOG_KEEP = /joined the game|left the game|<[^>]+>\s|Done \(|Starting minecraft server|Thrown|Exception/;
+
 function startLogTail() {
     if (logTimer) clearInterval(logTimer);
-    logOffset = 0;
+    tail = { offset: 0, decoder: null, rest: '' };
     logTimer = setInterval(() => {
         const file = path.join(cfg.serverDir, 'logs', 'latest.log');
         let st;
         try { st = fs.statSync(file); } catch { return; }
-        if (st.size < logOffset) logOffset = 0;
-        if (st.size === logOffset) return;
+        if (st.size < tail.offset) tail = { offset: 0, decoder: null, rest: '' };
+        if (st.size === tail.offset) return;
         try {
             const fd = fs.openSync(file, 'r');
-            const len = Math.min(st.size - logOffset, 512 * 1024);
+            const len = Math.min(st.size - tail.offset, 512 * 1024);
             const buf = Buffer.alloc(len);
-            fs.readSync(fd, buf, 0, len, logOffset);
+            const n = fs.readSync(fd, buf, 0, len, tail.offset);
             fs.closeSync(fd);
-            logOffset = st.size;
-            for (const raw of buf.toString('utf8').split('\n')) {
+            tail.offset += n;
+            if (!tail.decoder) tail.decoder = DECODERS[sniffEncoding(buf.subarray(0, Math.min(n, 8192)))]();
+            tail.rest += tail.decoder.decode(buf.subarray(0, n), { stream: true });
+            const lines = tail.rest.split('\n');
+            tail.rest = lines.pop();
+            for (const raw of lines) {
                 if (!raw) continue;
-                if (/joined the game|left the game|<[^>]+>\s|Done \(|Starting minecraft server/.test(raw)) {
-                    pushLog('server', raw.replace(/^\[[^\]]*\]\s*(\[[^\]]*\]\s*)?/, ''));
-                }
+                if (LOG_KEEP.test(raw)) pushLog('server', raw.replace(/^\[[^\]]*\]\s*(\[[^\]]*\]\s*)?/, ''));
             }
         } catch { /* 文件被占用，跳过 */ }
     }, 900);
@@ -166,8 +189,9 @@ async function startServer() {
     }
     serverProc = p;
     serverOwned = true;
-    pipeLines(p.stdout, 'server');
-    pipeLines(p.stderr, 'server');
+    // stdout 是 GBK；正常日志统一走 latest.log（带解码嗅探），这里只捞异常行，避免重复与乱码
+    pipeLines(p.stdout, 'server', 'gbk', /Exception|ERROR\]|Failed to|Could not|Address already in use/);
+    pipeLines(p.stderr, 'server', 'gbk', null);
     p.on('exit', (code) => {
         pushLog('panel', '服务器进程已退出（code=' + code + '）');
         serverProc = null; serverOwned = false;
