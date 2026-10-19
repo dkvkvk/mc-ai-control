@@ -73,14 +73,13 @@
                 </div>
 
                 <div class="card">
-                    <div class="card-head"><span class="card-dot dot" id="c-dot-bot"></span>AI 机器人</div>
+                    <div class="card-head"><span class="card-dot dot" id="c-dot-bot"></span>AI 机器人 <span class="hint" id="ov-bot-count">0 个</span></div>
                     <div class="card-body">
                         <div class="kv"><span>状态</span><b id="ov-bot-state">检查中…</b></div>
-                        <div class="kv"><span>名字</span><b id="ov-bot-name">AIBot</b></div>
-                        <div class="kv"><span>模型</span><b>cline-pass / deepseek-v4.1-flash</b></div>
+                        <div class="bot-mini-list" id="ov-bot-list"></div>
                         <div class="actions">
-                            <button class="btn btn-green" id="ov-btn-bot-start">启动机器人</button>
-                            <button class="btn btn-red" id="ov-btn-bot-stop">停止</button>
+                            <button class="btn btn-green" id="ov-btn-bot-start">启动全部</button>
+                            <button class="btn btn-red" id="ov-btn-bot-stop">停止全部</button>
                         </div>
                     </div>
                 </div>
@@ -99,6 +98,9 @@
                 <div class="card-head">快速派活 <span class="hint">相当于在游戏里对它说话</span></div>
                 <div class="card-body">
                     <div class="say-row">
+                        <select class="input select" id="ov-say-target">
+                            <option value="__all__">发给全部</option>
+                        </select>
                         <input class="input" id="ov-say-input" placeholder="例如：去砍三个木头 / 附近有羊吗 / 报一下你的坐标" />
                         <button class="btn btn-green" id="ov-say-btn">发送</button>
                     </div>
@@ -139,15 +141,43 @@
         <!-- ---- AI 机器人 ---- -->
         <section class="view" id="view-bot">
             <div class="card">
-                <div class="card-head">机器人控制</div>
+                <div class="card-head">机器人（可多开）<span class="hint" id="bt-mind-hint">MindServer :8080</span></div>
                 <div class="card-body">
-                    <div class="kv"><span>状态</span><b id="bt-state">检查中…</b></div>
-                    <div class="kv"><span>游戏内名字</span><b id="bt-name">AIBot</b></div>
-                    <div class="kv"><span>MindServer</span><b class="mono">http://localhost:8080</b></div>
+                    <div class="kv"><span>MindServer</span><b id="bt-state">检查中…</b></div>
+                    <div class="bot-list" id="bot-list"></div>
                     <div class="actions">
-                        <button class="btn btn-green" id="bt-btn-start">启动机器人</button>
-                        <button class="btn btn-red" id="bt-btn-stop">停止机器人</button>
+                        <button class="btn btn-green" id="bt-btn-start">启动全部</button>
+                        <button class="btn btn-red" id="bt-btn-stop">停止全部</button>
                         <button class="btn" id="bt-btn-ui">打开 MindServer 面板</button>
+                        <button class="btn btn-red" id="bt-btn-shutdown">关闭 MindServer</button>
+                    </div>
+                    <p class="note">每个机器人是独立进程，共用同一个服务端和同一个 MindServer；名字不能重复，进服约 10 秒。
+                        发言固定用 en 发出（不调用谷歌翻译），机器人会跟着你的提问语言回答。</p>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-head">添加机器人</div>
+                <div class="card-body">
+                    <div class="form-grid">
+                        <label>游戏内名字
+                            <input class="input" id="nb-name" placeholder="Bot1（3~16 位字母数字）" />
+                        </label>
+                        <label>模型
+                            <input class="input" id="nb-model" value="cline-pass/deepseek-v4.1-flash" />
+                        </label>
+                        <label>API 类型
+                            <input class="input" id="nb-api" value="deepseek" />
+                        </label>
+                        <label>接口地址
+                            <input class="input" id="nb-url" value="https://api.cline.bot/api/v1" />
+                        </label>
+                        <label>开场白（留空就不说话）
+                            <input class="input" id="nb-init" placeholder="你好，我是 Bot1" />
+                        </label>
+                    </div>
+                    <div class="actions">
+                        <button class="btn btn-green" id="nb-add">添加并启动</button>
                     </div>
                 </div>
             </div>
@@ -156,6 +186,9 @@
                 <div class="card-head">派活 / 对话</div>
                 <div class="card-body">
                     <div class="say-row">
+                        <select class="input select" id="bt-say-target">
+                            <option value="__all__">发给全部</option>
+                        </select>
                         <input class="input" id="bt-say-input" placeholder="用中文直接下指令，比如：搭一个 3x3 的小屋" />
                         <button class="btn btn-green" id="bt-say-btn">发送</button>
                     </div>
@@ -208,8 +241,8 @@
                         <input class="input mono" id="cfg-javaArgs" />
                     </div>
                     <div class="field">
-                        <label>机器人名字（游戏内 ID，≤16 字符）</label>
-                        <input class="input" id="cfg-botName" />
+                        <label>Minecraft 版本（机器人连服时用）</label>
+                        <input class="input" id="cfg-mcVersion" placeholder="1.20.1" />
                     </div>
                     <div class="field">
                         <label>服务端端口 / MindServer 端口</label>

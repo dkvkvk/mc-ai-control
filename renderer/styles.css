@@ -369,3 +369,82 @@ body::before {
 ::-webkit-scrollbar-track { background: #101010; border-left: 2px solid #000; }
 ::-webkit-scrollbar-thumb { background: #4a4a4a; border: 2px solid #000; }
 ::-webkit-scrollbar-thumb:hover { background: #5c5c5c; }
+
+/* ---------------- 多开机器人 ---------------- */
+.bot-list { display: flex; flex-direction: column; gap: 8px; margin: 10px 0 12px; }
+
+.bot-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px;
+    background: var(--slot);
+    border: 2px solid #000;
+    box-shadow: inset 2px 2px 0 rgba(255, 255, 255, .06), inset -2px -2px 0 rgba(0, 0, 0, .55);
+}
+
+.bot-row .dot { flex: none; }
+.bot-row .bot-name { font-weight: 700; color: #f2f2f2; min-width: 92px; }
+.bot-row .bot-meta {
+    flex: 1;
+    min-width: 0;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.bot-row .bot-tag {
+    flex: none;
+    font-size: 10px;
+    padding: 1px 6px;
+    color: #d8d8d8;
+    background: #333;
+    border: 1px solid #000;
+}
+.bot-row .btn { padding: 3px 8px; font-size: 11px; }
+
+.bot-mini-list { display: flex; flex-direction: column; gap: 6px; margin: 8px 0 10px; }
+.bot-mini {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: #e8e8e8;
+}
+.bot-mini .dot { flex: none; }
+.bot-mini .bot-mini-meta { margin-left: auto; font-family: var(--mono); font-size: 10px; color: var(--text-dim); }
+
+.bot-empty {
+    padding: 8px 10px;
+    font-size: 12px;
+    color: var(--text-dim);
+    background: var(--slot);
+    border: 2px dashed #444;
+}
+
+.form-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+    margin-bottom: 12px;
+}
+.form-grid label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 11px;
+    color: var(--text-dim);
+}
+.form-grid .input { width: 100%; }
+
+select.input.select {
+    width: 132px;
+    flex: none;
+    cursor: pointer;
+    appearance: none;
+    background: var(--slot);
+    color: #e8e8e8;
+    padding: 0 8px;
+}

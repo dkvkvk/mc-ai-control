@@ -25,7 +25,7 @@ const api = {
     stopServer: () => post('/api/server/stop'),
     startBot: () => post('/api/bot/start'),
     stopBot: () => post('/api/bot/stop'),
-    say: (text) => post('/api/say', { text }),
+    say: (text, to) => post('/api/say', { text, to }),
     history: () => get('/api/history'),
     clearLogs: () => post('/api/logs/clear'),
     openPath: (p) => post('/api/open', { path: p }),
@@ -175,23 +175,30 @@ async function refresh() {
     try { s = await api.status(); } catch { return; }
     state.status = s;
 
+    const bots = s.bots || [];
+    const inGame = bots.filter((b) => b.state === 'online').length;
+    const created = bots.filter((b) => b.state !== 'notcreated').length;
+
     setDot($('dot-server'), s.server.up);
-    setDot($('dot-bot'), s.bot.up);
+    setDot($('dot-bot'), s.bot.up, bots.length > 0);
     $('mini-server').textContent = s.server.up ? '运行中' : '已停止';
-    $('mini-bot').textContent = s.bot.up ? '在线' : '离线';
+    $('mini-bot').textContent = bots.length ? inGame + '/' + bots.length + ' 在线' : '无';
     $('mini-players').textContent = s.players.length + ' 人';
 
     setDot($('c-dot-server'), s.server.up);
-    setDot($('c-dot-bot'), s.bot.up);
+    setDot($('c-dot-bot'), inGame > 0, s.bot.up && inGame === 0);
     $('ov-server-state').textContent = s.server.up ? (s.server.owned ? '运行中（面板启动）' : '运行中（外部启动）') : '已停止';
     $('ov-server-port').textContent = s.server.port;
     $('ov-server-pid').textContent = s.server.pid || '—';
-    $('ov-bot-state').textContent = s.bot.up ? '在线' : (s.bot.running ? '启动中…' : '离线');
-    $('ov-bot-name').textContent = s.bot.name;
+    $('ov-bot-state').textContent = !s.bot.up
+        ? (bots.length ? 'MindServer 未启动' : '还没配置机器人')
+        : inGame + ' 个在线 / 共 ' + bots.length + ' 个';
+    $('ov-bot-count').textContent = bots.length + ' 个';
+    renderBotMini(bots);
     $('ov-btn-server-start').disabled = s.server.up;
     $('ov-btn-server-stop').disabled = !s.server.owned;
-    $('ov-btn-bot-start').disabled = s.bot.up || s.bot.running;
-    $('ov-btn-bot-stop').disabled = !s.bot.running;
+    $('ov-btn-bot-start').disabled = bots.length === 0;
+    $('ov-btn-bot-stop').disabled = created === 0;
 
     const slots = $('player-slots');
     slots.textContent = '';
@@ -218,12 +225,135 @@ async function refresh() {
     $('sv-btn-start').disabled = s.server.up;
     $('sv-btn-stop').disabled = !s.server.owned;
 
-    $('bt-state').textContent = s.bot.up ? '在线（MindServer 已就绪）' : '离线';
-    $('bt-name').textContent = s.bot.name;
-    $('bt-btn-start').disabled = s.bot.up || s.bot.running;
-    $('bt-btn-stop').disabled = !s.bot.running;
+    $('bt-state').textContent = s.bot.up
+        ? '运行中（127.0.0.1:' + s.bot.port + '）· ' + inGame + '/' + bots.length + ' 在线'
+        : (bots.length ? '未启动（点「启动全部」）' : '还没配置机器人');
+    $('bt-mind-hint').textContent = 'MindServer :' + s.bot.port;
+    renderBotList(bots);
+    fillSayTargets(bots);
+    $('bt-btn-start').disabled = bots.length === 0;
+    $('bt-btn-stop').disabled = created === 0;
+    $('bt-btn-shutdown').disabled = !s.bot.up;
     $('chip-port').textContent = ':' + s.server.port;
 }
+
+// ------------------------------------------------------------------ 机器人列表
+const STATE_LABEL = { online: '在线', starting: '进服中', offline: '已停止', notcreated: '未启动' };
+
+function makeDot(ok, warn) {
+    const d = document.createElement('span');
+    d.className = 'card-dot dot';
+    setDot(d, ok, warn);
+    return d;
+}
+
+function renderBotMini(bots) {
+    const box = $('ov-bot-list');
+    if (!box) return;
+    box.textContent = '';
+    if (!bots.length) {
+        const e = document.createElement('div');
+        e.className = 'bot-empty';
+        e.textContent = '还没有机器人，去「AI 机器人」页添加';
+        box.appendChild(e);
+        return;
+    }
+    for (const b of bots) {
+        const row = document.createElement('div');
+        row.className = 'bot-mini';
+        row.appendChild(makeDot(b.state === 'online', b.state === 'starting'));
+        const n = document.createElement('span');
+        n.textContent = b.name;
+        const m = document.createElement('span');
+        m.className = 'bot-mini-meta';
+        m.textContent = STATE_LABEL[b.state] || b.state;
+        row.appendChild(n);
+        row.appendChild(m);
+        box.appendChild(row);
+    }
+}
+
+function renderBotList(bots) {
+    const box = $('bot-list');
+    if (!box) return;
+    box.textContent = '';
+    if (!bots.length) {
+        const e = document.createElement('div');
+        e.className = 'bot-empty';
+        e.textContent = '还没有机器人，用下面的表单添加一个';
+        box.appendChild(e);
+        return;
+    }
+    for (const b of bots) {
+        const row = document.createElement('div');
+        row.className = 'bot-row';
+        row.dataset.name = b.name;
+        row.appendChild(makeDot(b.state === 'online', b.state === 'starting'));
+
+        const name = document.createElement('span');
+        name.className = 'bot-name';
+        name.textContent = b.name;
+        row.appendChild(name);
+
+        const meta = document.createElement('span');
+        meta.className = 'bot-meta';
+        meta.textContent = (b.model || '') + ' · ' + (STATE_LABEL[b.state] || b.state);
+        row.appendChild(meta);
+
+        if (b.enabled === false) {
+            const tag = document.createElement('span');
+            tag.className = 'bot-tag';
+            tag.textContent = '已禁用';
+            row.appendChild(tag);
+        }
+
+        const mk = (act, label, cls) => {
+            const btn = document.createElement('button');
+            btn.className = 'btn ' + cls;
+            btn.dataset.act = act;
+            btn.textContent = label;
+            if (act === 'start') btn.disabled = b.state === 'online' || b.state === 'starting';
+            if (act === 'stop') btn.disabled = b.state === 'notcreated';
+            row.appendChild(btn);
+        };
+        mk('start', '启动', 'btn-green');
+        mk('stop', '停止', 'btn-red');
+        mk('delete', '删除', '');
+        box.appendChild(row);
+    }
+}
+
+function fillSayTargets(bots) {
+    for (const id of ['bt-say-target', 'ov-say-target']) {
+        const sel = $(id);
+        if (!sel) continue;
+        const cur = sel.value;
+        sel.textContent = '';
+        sel.add(new Option('发给全部', '__all__'));
+        for (const b of bots) sel.add(new Option(b.name, b.name));
+        const has = [...sel.options].some((o) => o.value === cur);
+        sel.value = has ? cur : '__all__';
+    }
+}
+
+$('bot-list').addEventListener('click', async (e) => {
+    const btn = e.target.closest('button[data-act]');
+    if (!btn) return;
+    const row = btn.closest('.bot-row');
+    const name = row && row.dataset.name;
+    if (!name) return;
+    const act = btn.dataset.act;
+    btn.disabled = true;
+    try {
+        const r = act === 'start' ? await post('/api/bots/start', { name })
+            : act === 'stop' ? await post('/api/bots/stop', { name })
+                : await post('/api/bots/delete', { name });
+        if (r && r.msg) toast(r.msg, r.ok ? 'ok' : 'err');
+    } catch (err) {
+        toast('操作失败：' + (err && err.message ? err.message : err), 'err');
+    }
+    setTimeout(() => { refresh(); }, 600);
+});
 
 // ------------------------------------------------------------------ 配置
 async function loadConfig() {
@@ -232,7 +362,7 @@ async function loadConfig() {
     $('cfg-mindcraftDir').value = state.cfg.mindcraftDir;
     $('cfg-javaPath').value = state.cfg.javaPath;
     $('cfg-javaArgs').value = state.cfg.javaArgs;
-    $('cfg-botName').value = state.cfg.botName;
+    $('cfg-mcVersion').value = state.cfg.mcVersion || '1.20.1';
     $('cfg-serverPort').value = state.cfg.serverPort;
     $('cfg-mindserverPort').value = state.cfg.mindserverPort;
 }
@@ -249,7 +379,7 @@ $('cfg-save').addEventListener('click', async () => {
         mindcraftDir: $('cfg-mindcraftDir').value.trim(),
         javaPath: $('cfg-javaPath').value.trim(),
         javaArgs: $('cfg-javaArgs').value.trim(),
-        botName: $('cfg-botName').value.trim(),
+        mcVersion: $('cfg-mcVersion').value.trim() || '1.20.1',
         serverPort: Number($('cfg-serverPort').value) || 25565,
         mindserverPort: Number($('cfg-mindserverPort').value) || 8080,
     };
@@ -293,17 +423,39 @@ async function doSay(inputId) {
     const text = input.value.trim();
     if (!text) { toast('先写点什么再发', 'err'); return; }
     input.value = '';
+    const sel = targetId ? $(targetId) : null;
+    const to = sel ? sel.value : '__all__';
     try {
-        const r = await api.say(text);
+        const r = await api.say(text, to);
         toast(r.msg, r.ok ? 'ok' : 'err');
     } catch (e) {
         toast('发送失败：' + e.message, 'err');
     }
 }
-$('ov-say-btn').addEventListener('click', () => doSay('ov-say-input'));
-$('bt-say-btn').addEventListener('click', () => doSay('bt-say-input'));
-$('ov-say-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') doSay('ov-say-input'); });
-$('bt-say-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') doSay('bt-say-input'); });
+$('ov-say-btn').addEventListener('click', () => doSay('ov-say-input', 'ov-say-target'));
+$('bt-say-btn').addEventListener('click', () => doSay('bt-say-input', 'bt-say-target'));
+$('ov-say-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') doSay('ov-say-input', 'ov-say-target'); });
+$('bt-say-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') doSay('bt-say-input', 'bt-say-target'); });
+
+// 添加机器人（添加后立刻启动它）
+$('nb-add').addEventListener('click', async () => {
+    const body = {
+        name: $('nb-name').value.trim(),
+        model: $('nb-model').value.trim(),
+        api: $('nb-api').value.trim(),
+        url: $('nb-url').value.trim(),
+        initMessage: $('nb-init').value.trim(),
+    };
+    if (!body.name) { toast('先给机器人起个名字', 'err'); return; }
+    const r = await post('/api/bots', body);
+    toast(r.msg, r.ok ? 'ok' : 'err');
+    if (!r.ok) return;
+    $('nb-name').value = '';
+    $('nb-init').value = '';
+    const s = await post('/api/bots/start', { name: body.name });
+    if (s && s.msg) toast(s.msg, s.ok ? 'ok' : 'err');
+    setTimeout(refresh, 800);
+});
 
 $('sv-btn-open').addEventListener('click', () => api.openPath(state.cfg.serverDir));
 $('log-open-dir').addEventListener('click', () => api.openPath(state.cfg.serverDir + '/logs'));
@@ -316,6 +468,11 @@ $('log-clear').addEventListener('click', async () => {
 });
 $('bt-btn-ui').addEventListener('click', () => {
     window.open('http://localhost:' + (state.cfg.mindserverPort || 8080), '_blank');
+});
+$('bt-btn-shutdown').addEventListener('click', async () => {
+    const r = await post('/api/bot/shutdown', {});
+    if (r && r.msg) toast(r.msg, r.ok ? 'ok' : 'err');
+    setTimeout(refresh, 1500);
 });
 $('btn-refresh').addEventListener('click', () => { refresh(); poll(); toast('已刷新'); });
 

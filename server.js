@@ -1,19 +1,24 @@
 'use strict';
 /**
  * Minecraft AI 控制面板 —— 后端服务
- * 用纯 Node 提供 HTTP API + 静态页面，供 Edge 应用窗口 / 浏览器访问。
- * 不用 Electron（本机 Electron 一启动就崩，Chromium 窗口本身是正常的）。
+ * 纯 Node 提供 HTTP API + 静态页面，供 Edge 应用窗口 / 浏览器访问。
+ *
+ * 多开机器人的原理：MindServer(8080) 支持 socket 事件
+ *   create-agent / start-agent / stop-agent / destroy-agent / send-message
+ * 所以面板只跑「一个」MindServer 进程，机器人按需动态创建，互不影响。
  */
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const net = require('net');
 const { spawn } = require('child_process');
+const { createRequire } = require('module');
 
-const ROOT = __dirname;                       // 后端所在目录（= 资源解压目录）
+const ROOT = __dirname;
 const RENDERER = path.join(ROOT, 'renderer');
 const DATA_DIR = process.env.MCAI_DATA_DIR || path.join(ROOT, 'data');
 const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
+const BOTS_FILE = path.join(DATA_DIR, 'bots.json');
 
 const DEFAULTS = {
     // 占位默认值：真实路径保存在 data/config.json（不随仓库发布）
@@ -23,7 +28,7 @@ const DEFAULTS = {
     javaArgs: '-Xms1G -Xmx2G',
     serverPort: 25565,
     mindserverPort: 8080,
-    botName: 'AIBot',
+    mcVersion: '1.20.1',
     sayScript: 'say.mjs',
     nodePath: process.execPath,
 };
@@ -34,24 +39,74 @@ function loadConfig() {
     try { return { ...DEFAULTS, ...JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) }; }
     catch { return { ...DEFAULTS }; }
 }
-function saveConfig(cfg) {
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), 'utf8');
-}
+function saveConfig(cfg) { fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), 'utf8'); }
 
 let cfg = loadConfig();
 if (!fs.existsSync(CONFIG_FILE)) saveConfig(cfg);
 
+// ------------------------------------------------------------------ 机器人定义
+// 每个机器人 = 一份 mindcraft profile（名字 / 模型 / 接口），持久化在 data/bots.json
+function defaultBots() {
+    const seed = {
+        name: 'AIBot',
+        model: 'cline-pass/deepseek-v4.1-flash',
+        api: 'deepseek',
+        url: 'https://api.cline.bot/api/v1',
+        language: 'zh',
+        initMessage: '',
+        enabled: true,
+    };
+    // 首次运行：尽量沿用 mindcraft/profiles/cline.json 里已有的配置
+    try {
+        const p = JSON.parse(fs.readFileSync(path.join(cfg.mindcraftDir, 'profiles', 'cline.json'), 'utf8'));
+        if (p.name) Object.assign(seed, { name: p.name, model: p.model || seed.model, api: p.api || seed.api, url: p.url || seed.url });
+    } catch { /* 没有就算了 */ }
+    return [seed];
+}
+
+function loadBots() {
+    try {
+        const list = JSON.parse(fs.readFileSync(BOTS_FILE, 'utf8'));
+        if (Array.isArray(list)) return list;
+    } catch { /* 走默认 */ }
+    const list = defaultBots();
+    saveBots(list);
+    return list;
+}
+function saveBots(list) { fs.writeFileSync(BOTS_FILE, JSON.stringify(list, null, 2), 'utf8'); }
+
+let bots = loadBots();
+
+const BOT_NAME_RE = /^[A-Za-z0-9_]{3,16}$/;
+
+function botSettings(bot) {
+    return {
+        profile: { name: bot.name, model: bot.model, api: bot.api, url: bot.url },
+        host: '127.0.0.1',
+        port: cfg.serverPort,
+        minecraft_version: cfg.mcVersion || '1.20.1',
+        auth: 'offline',
+        base_profile: 'survival',
+        init_message: bot.initMessage || '',
+        // 固定 en：非 en 会让 mindcraft 调 google-translate-api-x 把发言翻译一遍，
+        // 国内基本连不上（报 "language zh unsupported / 网络失败"），而且机器人本来就跟着你的语言回答。
+        language: 'en',
+        load_memory: false,
+    };
+}
+
 // ------------------------------------------------------------------ 运行状态
 const LOG_LIMIT = 2000;
-const logs = [];              // {t, src, line}
-const chats = [];             // {t, from, text}
+const logs = [];
+const chats = [];
 const players = new Map();
-let seq = 0;                  // 单调递增序号，前端按 since 拉增量
-let lastBeat = Date.now();    // 前端心跳，用于窗口关掉后自动退出后端
+let seq = 0;
+let lastBeat = Date.now();
 
 let serverProc = null;
 let serverOwned = false;
-let botProc = null;
+let mindProc = null;          // MindServer（main.js）进程
+let agentsCache = [];         // 来自 MindServer 的 agents-status
 
 function pushLog(src, line, when) {
     const text = String(line == null ? '' : line).replace(/\r$/, '');
@@ -60,11 +115,11 @@ function pushLog(src, line, when) {
     logs.push(entry);
     if (logs.length > LOG_LIMIT) logs.shift();
 
-    const m = text.match(/<([^>]{1,32})>\s(.*)$/);
+    const m = text.match(/^<([^>]{1,32})>\s(.*)$/);
     if (m) {
         const c = { i: ++seq, t: entry.t, from: m[1], text: m[2] };
         chats.push(c);
-        if (chats.length > 500) chats.shift();
+        if (chats.length > 800) chats.shift();
     }
     const j = text.match(/([A-Za-z0-9_]{1,16}) joined the game/);
     const l = text.match(/([A-Za-z0-9_]{1,16}) left the game/);
@@ -74,7 +129,7 @@ function pushLog(src, line, when) {
 
 // ------------------------------------------------------------------ 解码
 // Windows 中文环境下 java 的 stdout 与 latest.log 常是 GBK（cp936），
-// 直接按 UTF-8 解会得到 "锛?/锟?" 这类乱码。这里先严格试 UTF-8，失败再回退 GBK。
+// 按 UTF-8 硬解会得到 "锛?/锟?" 这类乱码。先严格试 UTF-8，失败回退 GBK。
 const DECODERS = { utf8: () => new TextDecoder('utf-8'), gbk: () => new TextDecoder('gbk') };
 
 function sniffEncoding(buf) {
@@ -103,35 +158,32 @@ function pipeLines(stream, src, enc, only) {
     });
 }
 
-// 跟随服务端 latest.log（外部启动的服务器也能看到聊天）
-let logTimer = null;
-let tail = { offset: 0, decoder: null, rest: '' };
-const LOG_KEEP = /joined the game|left the game|<[^>]+>\s|Done \(|Starting minecraft server|Thrown|Exception/;
+// 跟随一个正在增长的文件：带编码嗅探的流式解码，按需过滤
+const followers = new Map();
 
-function startLogTail() {
-    if (logTimer) clearInterval(logTimer);
-    tail = { offset: 0, decoder: null, rest: '' };
-    logTimer = setInterval(() => {
-        const file = path.join(cfg.serverDir, 'logs', 'latest.log');
-        let st;
-        try { st = fs.statSync(file); } catch { return; }
-        if (st.size < tail.offset) tail = { offset: 0, decoder: null, rest: '' };
-        if (st.size === tail.offset) return;
+function followFile(key, filePath, src, keepRe) {
+    const old = followers.get(key);
+    if (old) clearInterval(old.timer);
+    const st = { offset: 0, decoder: null, rest: '' };
+    const timer = setInterval(() => {
+        let stat;
+        try { stat = fs.statSync(filePath); } catch { return; }
+        if (stat.size < st.offset) { st.offset = 0; st.decoder = null; st.rest = ''; }
+        if (stat.size === st.offset) return;
         try {
-            const fd = fs.openSync(file, 'r');
-            const len = Math.min(st.size - tail.offset, 512 * 1024);
+            const fd = fs.openSync(filePath, 'r');
+            const len = Math.min(stat.size - st.offset, 512 * 1024);
             const buf = Buffer.alloc(len);
-            const n = fs.readSync(fd, buf, 0, len, tail.offset);
+            const n = fs.readSync(fd, buf, 0, len, st.offset);
             fs.closeSync(fd);
-            tail.offset += n;
-            if (!tail.decoder) tail.decoder = DECODERS[sniffEncoding(buf.subarray(0, Math.min(n, 8192)))]();
-            tail.rest += tail.decoder.decode(buf.subarray(0, n), { stream: true });
-            const lines = tail.rest.split('\n');
-            tail.rest = lines.pop();
+            st.offset += n;
+            if (!st.decoder) st.decoder = DECODERS[sniffEncoding(buf.subarray(0, Math.min(n, 8192)))]();
+            st.rest += st.decoder.decode(buf.subarray(0, n), { stream: true });
+            const lines = st.rest.split('\n');
+            st.rest = lines.pop();
             for (const raw of lines) {
                 if (!raw) continue;
-                if (!LOG_KEEP.test(raw)) continue;
-                // 用日志自带的时间戳（回放历史时不会全挤在同一秒）
+                if (keepRe && !keepRe.test(raw)) continue;
                 let when;
                 const tm = raw.match(/^\[(\d{2}):(\d{2}):(\d{2})\]/);
                 if (tm) {
@@ -142,13 +194,26 @@ function startLogTail() {
                 const clean = raw
                     .replace(/^\[[^\]]*\]\s*(?:\[[^\]]*\]\s*)?:?\s*/, '')
                     .replace(/^\[Not Secure\]\s*/, '');
-                pushLog('server', clean, when);
+                pushLog(src, clean, when);
             }
         } catch { /* 文件被占用，跳过 */ }
     }, 900);
+    followers.set(key, { timer, st });
 }
 
-// ------------------------------------------------------------------ 工具
+// 跟随服务端 latest.log（外部启动的服务器也能看到聊天）
+const LOG_KEEP = /joined the game|left the game|<[^>]+>\s|Done \(|Starting minecraft server|Thrown|Exception/;
+
+function startLogTail() {
+    followFile('server', path.join(cfg.serverDir, 'logs', 'latest.log'), 'server', LOG_KEEP);
+}
+
+// 机器人的输出（MindServer 进程与各 agent 子进程的 stdout）
+function startMindTail() {
+    followFile('mind', path.join(DATA_DIR, 'mindserver.log'), 'bot', null);
+}
+
+// ------------------------------------------------------------------ 端口 / 进程
 function probePort(port, host = '127.0.0.1') {
     return new Promise((resolve) => {
         const s = new net.Socket();
@@ -166,23 +231,193 @@ async function portOpen(port) {
     return await probePort(port, '::1');   // MindServer 在 Windows 上常只绑 IPv6
 }
 
-async function getStatus() {
-    const [serverUp, mindUp] = await Promise.all([portOpen(cfg.serverPort), portOpen(cfg.mindserverPort)]);
-    return {
-        server: { up: serverUp, owned: serverOwned && !!serverProc, pid: serverProc ? serverProc.pid : null, port: cfg.serverPort },
-        bot: { up: mindUp, running: !!botProc, pid: botProc ? botProc.pid : null, name: cfg.botName },
-        players: [...players.keys()],
-        paths: {
-            serverDir: cfg.serverDir,
-            mindcraftDir: cfg.mindcraftDir,
-            serverDirOk: fs.existsSync(path.join(cfg.serverDir, 'server.jar')),
-            mindcraftDirOk: fs.existsSync(path.join(cfg.mindcraftDir, 'main.js')),
-            javaOk: fs.existsSync(cfg.javaPath),
-        },
-        configFile: CONFIG_FILE,
-    };
+// ------------------------------------------------------------------ MindServer 客户端
+let mindReq = null;
+let mSock = null;
+let mSockTried = false;
+let lastMindError = '';
+
+function mindRequire() {
+    if (!mindReq) mindReq = createRequire(path.join(cfg.mindcraftDir, 'package.json'));
+    return mindReq;
 }
 
+// MindServer 监听 'localhost'，在 Windows 上会解析到 IPv6(::1)，因此这里也用 localhost 连
+function mindUrl() { return 'http://localhost:' + cfg.mindserverPort; }
+
+function ensureMind() {
+    return new Promise((resolve) => {
+        const { io } = mindRequire()('socket.io-client');
+        if (mSock && mSock.connected) return resolve(mSock);
+        if (!mSock) {
+            mSock = io(mindUrl(), {
+                transports: ['websocket'],
+                reconnection: true,
+                reconnectionDelay: 800,
+                timeout: 4000,
+            });
+            mSock.on('agents-status', (list) => { agentsCache = Array.isArray(list) ? list : []; });
+            mSock.on('connect', () => { lastMindError = ''; });
+            mSock.on('connect_error', (e) => { lastMindError = String(e && e.message || e); });
+        }
+        let waited = 0;
+        const tick = setInterval(() => {
+            if (mSock && mSock.connected) { clearInterval(tick); resolve(mSock); }
+            else if ((waited += 200) >= 5000) { clearInterval(tick); resolve(null); }
+        }, 200);
+        mSockTried = true;
+    });
+}
+
+function emitAsync(event, payload) {
+    return new Promise((resolve) => {
+        if (!mSock || !mSock.connected) return resolve({ success: false, error: 'MindServer 未连接' });
+        let done = false;
+        const timer = setTimeout(() => {
+            if (done) return;
+            done = true;
+            resolve({ success: false, error: '等待 MindServer 回应超时' });
+        }, 25000);
+        mSock.emit(event, payload, (res) => {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            resolve(res || {});
+        });
+    });
+}
+
+function waitAgents(name, timeoutMs) {
+    return new Promise((resolve) => {
+        const t0 = Date.now();
+        const tick = setInterval(() => {
+            const a = agentsCache.find((x) => x.name === name);
+            if (a || Date.now() - t0 > timeoutMs) { clearInterval(tick); resolve(a || null); }
+        }, 300);
+    });
+}
+
+// ------------------------------------------------------------------ 机器人动作
+async function startBotOne(name) {
+    const bot = bots.find((b) => b.name === name);
+    if (!bot) return { ok: false, msg: '没有这个机器人：' + name };
+
+    if (!(await portOpen(cfg.mindserverPort))) {
+        return { ok: false, msg: 'MindServer 还没起，请先点「启动 MindServer」。' };
+    }
+    await ensureMind();
+    if (!mSock || !mSock.connected) {
+        return { ok: false, msg: '连不上 MindServer：' + (lastMindError || '原因未知') };
+    }
+
+    const exist = agentsCache.find((a) => a.name === name);
+    if (exist) {
+        mSock.emit('start-agent', name);           // 已注册但进程被停过 → 重新拉起
+        pushLog('panel', '重启机器人 ' + name);
+        return { ok: true, msg: name + ' 启动中…' };
+    }
+
+    const res = await emitAsync('create-agent', botSettings(bot));
+    if (res && res.success === false) return { ok: false, msg: name + ' 创建失败：' + (res.error || '未知原因') };
+    pushLog('panel', '创建机器人 ' + name + '（' + bot.model + '）');
+    return { ok: true, msg: name + ' 正在进服…' };
+}
+
+async function stopBotOne(name) {
+    if (!mSock || !mSock.connected) return { ok: false, msg: 'MindServer 未连接。' };
+    mSock.emit('stop-agent', name);
+    pushLog('panel', '停止机器人 ' + name);
+    return { ok: true, msg: name + ' 已停止。' };
+}
+
+async function destroyBotOne(name) {
+    if (mSock && mSock.connected) mSock.emit('destroy-agent', name);
+    return { ok: true };
+}
+
+async function startBot() {
+    // 1) 确保 MindServer 在跑（只跑服务，不自动创建任何机器人）
+    if (!(await portOpen(cfg.mindserverPort))) {
+        const main = path.join(cfg.mindcraftDir, 'main.js');
+        if (!fs.existsSync(main)) return { ok: false, msg: '找不到 main.js：' + main };
+        pushLog('panel', '启动 MindServer（不自动建 bot）…');
+        // 输出写文件而不是管道：这样面板关掉、管道断开也不会把 MindServer 带走
+        const mindLog = fs.openSync(path.join(DATA_DIR, 'mindserver.log'), 'a');
+        const p = spawn(cfg.nodePath, ['main.js'], {
+            cwd: cfg.mindcraftDir,
+            windowsHide: true,
+            stdio: ['ignore', mindLog, mindLog],
+            env: { ...process.env, SETTINGS_JSON: JSON.stringify({ profiles: [] }) },
+        });
+        fs.closeSync(mindLog);
+        mindProc = p;
+        startMindTail();
+        p.on('exit', (code) => {
+            pushLog('panel', 'MindServer 已退出（code=' + code + '）');
+            mindProc = null;
+            agentsCache = [];
+        });
+        // 等端口起来
+        const t0 = Date.now();
+        while (Date.now() - t0 < 25000) {
+            if (await portOpen(cfg.mindserverPort)) break;
+            await new Promise((r) => setTimeout(r, 500));
+        }
+        if (!(await portOpen(cfg.mindserverPort))) return { ok: false, msg: 'MindServer 启动失败（端口无响应）。' };
+    }
+    await ensureMind();
+
+    // 2) 逐个创建「已启用」的机器人
+    const targets = bots.filter((b) => b.enabled !== false);
+    if (!targets.length) return { ok: true, msg: 'MindServer 已就绪，但没有启用的机器人。' };
+
+    const results = [];
+    for (const bot of targets) {
+        const r = await startBotOne(bot.name);
+        results.push(bot.name + (r.ok ? ' ✓' : ' ✗'));
+        await new Promise((res) => setTimeout(res, 1200));   // 错开进服，避免同时抢名
+    }
+    return { ok: true, msg: '已提交：' + results.join('、') };
+}
+
+async function stopBot() {
+    let n = 0;
+    if (mSock && mSock.connected) {
+        mSock.emit('stop-all-agents');
+        n = agentsCache.length;
+    }
+    pushLog('panel', '停止全部机器人（' + n + '）');
+    return { ok: true, msg: n ? '已停止 ' + n + ' 个机器人。' : '没有在跑的机器人。' };
+}
+
+async function shutdownMind() {
+    if (!await portOpen(cfg.mindserverPort)) return { ok: true, msg: 'MindServer 本来就没在跑。' };
+    await ensureMind();
+    if (mSock && mSock.connected) mSock.emit('shutdown');
+    await new Promise((r) => setTimeout(r, 1200));
+    if (mindProc) { try { mindProc.kill(); } catch { } mindProc = null; }
+    agentsCache = [];
+    pushLog('panel', 'MindServer 已关闭');
+    return { ok: true, msg: 'MindServer 已关闭。' };
+}
+
+async function say(text, to) {
+    if (!mSock || !mSock.connected) await ensureMind();
+    if (!mSock || !mSock.connected) return { ok: false, msg: '连不上 MindServer（机器人服务没起？）' };
+
+    const inGame = agentsCache.filter((a) => a.in_game).map((a) => a.name);
+    let targets;
+    if (!to || to === '__all__') targets = inGame;
+    else targets = inGame.filter((n) => n === to);
+
+    if (!targets.length) return { ok: false, msg: '没有在游戏里的机器人可派活。' };
+
+    for (const name of targets) mSock.emit('send-message', name, { from: 'Player', message: text });
+    pushLog('panel', '[派活] Player → ' + targets.join('、') + '：' + text);
+    return { ok: true, msg: '已发给 ' + targets.join('、') + '，等它回应。' };
+}
+
+// ------------------------------------------------------------------ 服务端
 async function startServer() {
     if (await portOpen(cfg.serverPort)) {
         serverOwned = false;
@@ -218,62 +453,62 @@ function stopServer() {
             return resolve({ ok: false, msg: '服务器不是本面板启动的，无法从面板关闭（请在控制台输入 stop）。' });
         }
         pushLog('panel', '正在停止服务器（发送 stop）…');
-        try { serverProc.stdin.write('stop\n'); } catch {}
+        try { serverProc.stdin.write('stop\n'); } catch { }
         const timer = setTimeout(() => {
-            if (serverProc) { try { spawn('taskkill', ['/pid', String(serverProc.pid), '/T', '/F'], { windowsHide: true }); } catch {} }
+            if (serverProc) { try { spawn('taskkill', ['/pid', String(serverProc.pid), '/T', '/F'], { windowsHide: true }); } catch { } }
         }, 15000);
         serverProc.once('exit', () => { clearTimeout(timer); resolve({ ok: true, msg: '服务器已停止。' }); });
     });
 }
 
-async function startBot() {
-    if (botProc) return { ok: false, msg: '机器人已在运行。' };
-    if (await portOpen(cfg.mindserverPort)) return { ok: false, msg: '8080 已被占用（MindServer 已在跑）。' };
-    const main = path.join(cfg.mindcraftDir, 'main.js');
-    if (!fs.existsSync(main)) return { ok: false, msg: '找不到 main.js：' + main };
-    pushLog('panel', '启动 AI 机器人…');
-    let p;
-    try {
-        p = spawn(cfg.nodePath, ['main.js'], { cwd: cfg.mindcraftDir, windowsHide: true });
-    } catch (e) {
-        return { ok: false, msg: '启动失败：' + e.message };
+// ------------------------------------------------------------------ 状态汇总
+function botStateOf(name) {
+    const a = agentsCache.find((x) => x.name === name);
+    if (!a) return 'notcreated';
+    if (a.in_game) return 'online';
+    if (a.socket_connected) return 'starting';
+    return 'offline';
+}
+
+async function getStatus() {
+    const [serverUp, mindUp] = await Promise.all([portOpen(cfg.serverPort), portOpen(cfg.mindserverPort)]);
+    if (mindUp && (!mSock || !mSock.connected)) {
+        // MindServer 起来了但客户端还没连上 → 顺手连一次，拿到 agents-status
+        ensureMind();
     }
-    botProc = p;
-    pipeLines(p.stdout, 'bot');
-    pipeLines(p.stderr, 'bot');
-    p.on('exit', (code) => {
-        pushLog('panel', '机器人进程已退出（code=' + code + '）');
-        botProc = null;
-    });
-    return { ok: true, msg: 'AI 机器人启动中，登录游戏约 10 秒。' };
-}
+    if (!mindUp) agentsCache = [];
 
-function stopBot() {
-    return new Promise((resolve) => {
-        if (!botProc) return resolve({ ok: false, msg: '机器人不是本面板启动的。' });
-        const pid = botProc.pid;
-        pushLog('panel', '正在停止机器人…');
-        try { spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true }); } catch {}
-        const timer = setTimeout(() => { botProc = null; resolve({ ok: true, msg: '已强制结束。' }); }, 6000);
-        botProc.once('exit', () => { clearTimeout(timer); botProc = null; resolve({ ok: true, msg: '机器人已停止。' }); });
-    });
-}
-
-function say(text) {
-    return new Promise((resolve) => {
-        const scriptName = cfg.sayScript || 'say.mjs';
-        if (!fs.existsSync(path.join(cfg.mindcraftDir, scriptName))) {
-            return resolve({ ok: false, msg: '找不到 ' + scriptName });
-        }
-        const p = spawn(cfg.nodePath, [scriptName, 'Player', String(text)], { cwd: cfg.mindcraftDir, windowsHide: true });
-        let out = '';
-        p.stdout.setEncoding('utf8'); p.stdout.on('data', (d) => { out += d; });
-        p.stderr.setEncoding('utf8'); p.stderr.on('data', (d) => { out += d; });
-        p.on('exit', (code) => {
-            pushLog('panel', '[派活] Player → ' + text);
-            resolve({ ok: code === 0, msg: code === 0 ? '已发送，等它回应。' : '发送失败：' + out.slice(0, 300) });
-        });
-    });
+    return {
+        server: { up: serverUp, owned: serverOwned && !!serverProc, pid: serverProc ? serverProc.pid : null, port: cfg.serverPort },
+        bot: {
+            up: mindUp,
+            running: !!mindProc,
+            pid: mindProc ? mindProc.pid : null,
+            port: cfg.mindserverPort,
+            agents: agentsCache,
+        },
+        bots: bots.map((b) => ({
+            name: b.name,
+            model: b.model,
+            api: b.api,
+            url: b.url,
+            language: b.language || 'zh',
+            initMessage: b.initMessage || '',
+            enabled: b.enabled !== false,
+            state: botStateOf(b.name),
+            inGame: !!agentsCache.find((a) => a.name === b.name && a.in_game),
+        })),
+        players: [...players.keys()],
+        paths: {
+            serverDir: cfg.serverDir,
+            mindcraftDir: cfg.mindcraftDir,
+            serverDirOk: fs.existsSync(path.join(cfg.serverDir, 'server.jar')),
+            mindcraftDirOk: fs.existsSync(path.join(cfg.mindcraftDir, 'main.js')),
+            javaOk: fs.existsSync(cfg.javaPath),
+        },
+        configFile: CONFIG_FILE,
+        botsFile: BOTS_FILE,
+    };
 }
 
 // ------------------------------------------------------------------ HTTP
@@ -322,14 +557,74 @@ const server = http.createServer(async (req, res) => {
             return json(res, 200, { ok: true, msg: '配置已保存：' + CONFIG_FILE });
         }
         if (p === '/api/status') return json(res, 200, await getStatus());
+
+        // ---- 服务器
         if (p === '/api/server/start') return json(res, 200, await startServer());
         if (p === '/api/server/stop') return json(res, 200, await stopServer());
+
+        // ---- 机器人（多开）
+        if (p === '/api/bots' && req.method === 'GET') return json(res, 200, { bots: (await getStatus()).bots });
+
+        if (p === '/api/bots' && req.method === 'POST') {
+            const body = await readBody(req);
+            const name = String(body.name || '').trim();
+            if (!BOT_NAME_RE.test(name)) return json(res, 200, { ok: false, msg: '名字只能用 3~16 位字母/数字/下划线。' });
+            if (!body.model) return json(res, 200, { ok: false, msg: '模型不能为空。' });
+            if (!body.url) return json(res, 200, { ok: false, msg: '接口地址不能为空。' });
+
+            const def = {
+                name,
+                model: String(body.model).trim(),
+                api: String(body.api || 'deepseek').trim(),
+                url: String(body.url).trim(),
+                language: String(body.language || 'zh').trim(),
+                initMessage: String(body.initMessage || '').trim(),
+                enabled: body.enabled !== false,
+            };
+            const idx = bots.findIndex((b) => b.name === name);
+            if (idx >= 0) bots[idx] = { ...bots[idx], ...def };
+            else bots.push(def);
+            saveBots(bots);
+            return json(res, 200, { ok: true, msg: (idx >= 0 ? '已更新 ' : '已添加 ') + name });
+        }
+
+        if (p === '/api/bots/delete' && req.method === 'POST') {
+            const body = await readBody(req);
+            const name = String(body.name || '');
+            await destroyBotOne(name);
+            bots = bots.filter((b) => b.name !== name);
+            saveBots(bots);
+            return json(res, 200, { ok: true, msg: '已删除 ' + name });
+        }
+
+        if (p === '/api/bots/toggle' && req.method === 'POST') {
+            const body = await readBody(req);
+            const bot = bots.find((b) => b.name === body.name);
+            if (!bot) return json(res, 200, { ok: false, msg: '没有这个机器人' });
+            bot.enabled = !!body.enabled;
+            saveBots(bots);
+            return json(res, 200, { ok: true, msg: bot.name + (bot.enabled ? ' 已启用' : ' 已禁用') });
+        }
+
+        if (p === '/api/bots/start' && req.method === 'POST') {
+            const body = await readBody(req);
+            return json(res, 200, await startBotOne(String(body.name || '')));
+        }
+        if (p === '/api/bots/stop' && req.method === 'POST') {
+            const body = await readBody(req);
+            return json(res, 200, await stopBotOne(String(body.name || '')));
+        }
+
+        // ---- 全部机器人（兼容旧接口）
         if (p === '/api/bot/start') return json(res, 200, await startBot());
         if (p === '/api/bot/stop') return json(res, 200, await stopBot());
+        if (p === '/api/bot/shutdown') return json(res, 200, await shutdownMind());
+
         if (p === '/api/say' && req.method === 'POST') {
             const body = await readBody(req);
-            return json(res, 200, await say(body.text || ''));
+            return json(res, 200, await say(body.text || '', body.to));
         }
+
         if (p === '/api/history') return json(res, 200, { logs: logs.slice(-600), chats: chats.slice(-200), next: seq });
         if (p === '/api/logs') {
             const since = Number(u.searchParams.get('since') || 0);
@@ -363,10 +658,9 @@ function listen(port, tries = 12) {
     });
     server.listen(port, '127.0.0.1', () => {
         startLogTail();
+        if (fs.existsSync(path.join(DATA_DIR, 'mindserver.log'))) startMindTail();   // 面板重开时继续跟
         pushLog('panel', '控制面板后端已启动，端口 ' + port);
-        // 用一行固定格式告知启动器真实端口
         console.log('MCAI_READY ' + port);
-        // 窗口关掉后（心跳停止）自动退出，别留后台僵尸
         setInterval(() => {
             if (Date.now() - lastBeat > 60000) {
                 pushLog('panel', '前端已断开，后端退出');
@@ -377,6 +671,5 @@ function listen(port, tries = 12) {
 }
 listen(WANTED);
 
-// 退出时别把子进程拖死：让 java / bot 继续跑
 process.on('SIGTERM', () => process.exit(0));
 process.on('SIGINT', () => process.exit(0));
