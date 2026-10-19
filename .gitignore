@@ -1,0 +1,25 @@
+# 依赖与构建产物
+node_modules/
+dist/
+shots/
+*.log
+hello.cs
+probe-main.js
+electron-out.log
+electron-err.log
+probe.log
+shot.mjs
+
+# 运行时数据（含本机真实路径，绝不入库）
+data/
+*.zip
+
+# 凭据：任何形式的密钥都不许进仓库
+keys.json
+keys*.json
+*.credentials.yaml
+.credentials.yaml
+*.pem
+*.key
+.env
+.env.*

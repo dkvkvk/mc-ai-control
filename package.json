@@ -1,0 +1,43 @@
+{
+  "name": "minecraft-ai-panel",
+  "version": "1.0.0",
+  "description": "Minecraft AI 服务器控制面板 - 侧边栏面板 / 全中文 / MC 像素风",
+  "main": "main.js",
+  "author": "local",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win portable"
+  },
+  "devDependencies": {
+    "electron": "^44.9.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "local.minecraftai.panel",
+    "productName": "MC-AI-Control",
+    "artifactName": "MC-AI-Control-${version}.exe",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**",
+      "config.default.json"
+    ],
+    "win": {
+      "target": [
+        "portable"
+      ]
+    },
+    "portable": {
+      "unpackDirName": "MCAIControl"
+    },
+    "electronDownload": {
+      "mirror": "https://npmmirror.com/mirrors/electron/"
+    }
+  }
+}
