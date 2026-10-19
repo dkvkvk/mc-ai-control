@@ -53,10 +53,10 @@ let serverProc = null;
 let serverOwned = false;
 let botProc = null;
 
-function pushLog(src, line) {
+function pushLog(src, line, when) {
     const text = String(line == null ? '' : line).replace(/\r$/, '');
     if (!text.trim()) return;
-    const entry = { i: ++seq, t: Date.now(), src, line: text };
+    const entry = { i: ++seq, t: when || Date.now(), src, line: text };
     logs.push(entry);
     if (logs.length > LOG_LIMIT) logs.shift();
 
@@ -130,7 +130,19 @@ function startLogTail() {
             tail.rest = lines.pop();
             for (const raw of lines) {
                 if (!raw) continue;
-                if (LOG_KEEP.test(raw)) pushLog('server', raw.replace(/^\[[^\]]*\]\s*(?:\[[^\]]*\]\s*)?:?\s*/, ''));
+                if (!LOG_KEEP.test(raw)) continue;
+                // 用日志自带的时间戳（回放历史时不会全挤在同一秒）
+                let when;
+                const tm = raw.match(/^\[(\d{2}):(\d{2}):(\d{2})\]/);
+                if (tm) {
+                    const d = new Date();
+                    d.setHours(+tm[1], +tm[2], +tm[3], 0);
+                    when = d.getTime();
+                }
+                const clean = raw
+                    .replace(/^\[[^\]]*\]\s*(?:\[[^\]]*\]\s*)?:?\s*/, '')
+                    .replace(/^\[Not Secure\]\s*/, '');
+                pushLog('server', clean, when);
             }
         } catch { /* 文件被占用，跳过 */ }
     }, 900);
