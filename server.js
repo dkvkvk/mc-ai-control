@@ -126,8 +126,13 @@ function probePort(port, host = '127.0.0.1') {
     });
 }
 
+async function portOpen(port) {
+    if (await probePort(port, '127.0.0.1')) return true;
+    return await probePort(port, '::1');   // MindServer 在 Windows 上常只绑 IPv6
+}
+
 async function getStatus() {
-    const [serverUp, mindUp] = await Promise.all([probePort(cfg.serverPort), probePort(cfg.mindserverPort)]);
+    const [serverUp, mindUp] = await Promise.all([portOpen(cfg.serverPort), portOpen(cfg.mindserverPort)]);
     return {
         server: { up: serverUp, owned: serverOwned && !!serverProc, pid: serverProc ? serverProc.pid : null, port: cfg.serverPort },
         bot: { up: mindUp, running: !!botProc, pid: botProc ? botProc.pid : null, name: cfg.botName },
@@ -144,7 +149,7 @@ async function getStatus() {
 }
 
 async function startServer() {
-    if (await probePort(cfg.serverPort)) {
+    if (await portOpen(cfg.serverPort)) {
         serverOwned = false;
         startLogTail();
         return { ok: true, msg: '检测到端口已在监听（外部启动的服务器），已接管日志监听。' };
@@ -187,7 +192,7 @@ function stopServer() {
 
 async function startBot() {
     if (botProc) return { ok: false, msg: '机器人已在运行。' };
-    if (await probePort(cfg.mindserverPort)) return { ok: false, msg: '8080 已被占用（MindServer 已在跑）。' };
+    if (await portOpen(cfg.mindserverPort)) return { ok: false, msg: '8080 已被占用（MindServer 已在跑）。' };
     const main = path.join(cfg.mindcraftDir, 'main.js');
     if (!fs.existsSync(main)) return { ok: false, msg: '找不到 main.js：' + main };
     pushLog('panel', '启动 AI 机器人…');
